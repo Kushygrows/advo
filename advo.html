@@ -1410,6 +1410,70 @@ function toastWithAction(msg, kind, actionLabel, onAction){
   el.insertBefore(btn, el.lastChild);
 }
 
+// Shared clipboard helper. navigator.clipboard.writeText() can reject or be
+// entirely unavailable (permission denied, insecure/non-https context, some
+// file:// browser configurations) and every call site used to just swallow
+// that with a bare .then() and no .catch() — the button would do nothing
+// with zero feedback. Every copy button in the app should route through
+// this so a failure is never silent: falls back to a legacy
+// execCommand("copy") textarea trick, and if even that throws, tells the
+// user plainly to copy the text by hand instead of pretending it worked.
+// onSuccess runs identically whichever path actually copied the text, so
+// existing per-button behavior (toast wording, button label swap, history
+// logging) is unaffected — only the failure case changes.
+function copyText(text, onSuccess){
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(text).then(
+      ()=> onSuccess(),
+      ()=> legacyCopyFallback(text, onSuccess)
+    );
+  } else {
+    legacyCopyFallback(text, onSuccess);
+  }
+}
+function legacyCopyFallback(text, onSuccess){
+  try{
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    ta.style.pointerEvents = "none";
+    document.body.appendChild(ta);
+    ta.select();
+    ta.setSelectionRange(0, text.length);
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    if(ok){
+      onSuccess();
+    } else {
+      toast("Couldn't copy automatically — select and copy the text manually.", "warn");
+    }
+  }catch(e){
+    toast("Couldn't copy automatically — select and copy the text manually.", "warn");
+  }
+}
+
+// Shared modal focus trap. Keeps Tab/Shift+Tab cycling within a container's
+// own focusable controls instead of letting keyboard focus escape onto the
+// (visually hidden) page behind an open overlay — a WCAG 2.2 focus-order
+// requirement. Filters out anything disabled or not actually visible
+// (offsetParent === null covers display:none and detached elements) so a
+// hidden control never gets wrongly treated as the first/last stop.
+function trapFocus(container, e){
+  if(e.key !== "Tab") return;
+  const focusables = container.querySelectorAll(
+    'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  const list = Array.from(focusables).filter(el => !el.disabled && el.offsetParent !== null);
+  if(list.length === 0) return;
+  const first = list[0], last = list[list.length - 1];
+  if(e.shiftKey && document.activeElement === first){
+    e.preventDefault(); last.focus();
+  } else if(!e.shiftKey && document.activeElement === last){
+    e.preventDefault(); first.focus();
+  }
+}
+
 // ---------- FACT BANK ----------
 // V1 first-run change: a brand-new user (nothing in local storage yet) now
 // lands on an EMPTY fact bank with the Sync panel as the obvious next step,
@@ -2604,7 +2668,7 @@ function renderFactBank(){
       const citation = isNoteSource(f.source)
         ? `"${f.text}" — ${formatSourceForDisplay(f.source)} (not independently verified)`
         : `"${f.text}" — ${getDomain(f.source)}. ${f.source}`;
-      navigator.clipboard.writeText(citation).then(()=> toast("Citation copied.", "ok"));
+      copyText(citation, ()=> toast("Citation copied.", "ok"));
     };
   });
   list.querySelectorAll(".edit-fact-btn").forEach(btn=>{
@@ -2905,7 +2969,7 @@ function renderPreviews(){
       const text = decodeURIComponent(btn.getAttribute("data-text"));
       const platformName = btn.getAttribute("data-platform");
       const detail = btn.getAttribute("data-detail") || `${draft.fact.id} · ${draft.angle.name}`;
-      navigator.clipboard.writeText(text).then(()=>{
+      copyText(text, ()=>{
         btn.textContent = "✅ Copied";
         setTimeout(()=>{ btn.textContent = "📋 Copy for " + platformName; }, 1500);
         logHistory(`Copied for ${platformName}`, detail);
@@ -3167,7 +3231,7 @@ function showPromptFallback(topic){
 
 document.getElementById("copyPromptBtn").onclick = ()=>{
   const box = document.getElementById("promptOutput");
-  navigator.clipboard.writeText(box.value).then(()=>{
+  copyText(box.value, ()=>{
     const btn = document.getElementById("copyPromptBtn");
     btn.textContent = "✅ Copied";
     setTimeout(()=>{ btn.textContent = "📋 Copy this AI prompt"; }, 1500);
@@ -3369,7 +3433,7 @@ document.querySelectorAll(".stellar-copy-btn").forEach(btn=>{
     const targetEl = document.getElementById(btn.getAttribute("data-copy-target"));
     const text = targetEl ? targetEl.textContent : "";
     if(!text) return;
-    navigator.clipboard.writeText(text).then(()=> toast("Copied.", "ok"));
+    copyText(text, ()=> toast("Copied.", "ok"));
   };
 });
 
@@ -4173,7 +4237,7 @@ function renderEngineResults(){
   });
   container.querySelectorAll(".copyQueryBtn").forEach(btn=>{
     btn.onclick = ()=>{
-      navigator.clipboard.writeText(decodeURIComponent(btn.getAttribute("data-text"))).then(()=>{
+      copyText(decodeURIComponent(btn.getAttribute("data-text")), ()=>{
         btn.textContent = "✅ Copied";
         setTimeout(()=>{ btn.textContent = "📋 Copy query"; }, 1500);
       });
@@ -4539,19 +4603,19 @@ function renderOutline(outline){
 
   out.querySelectorAll(".copyTitleBtn").forEach(btn=>{
     btn.onclick = ()=>{
-      navigator.clipboard.writeText(decodeURIComponent(btn.getAttribute("data-text"))).then(()=> toast("Title copied.", "ok"));
+      copyText(decodeURIComponent(btn.getAttribute("data-text")), ()=> toast("Title copied.", "ok"));
     };
   });
   const copyTagsBtn = document.getElementById("copyTagsBtn");
   if(copyTagsBtn){
     copyTagsBtn.onclick = ()=>{
-      navigator.clipboard.writeText(decodeURIComponent(copyTagsBtn.getAttribute("data-text"))).then(()=> toast("Tag list copied.", "ok"));
+      copyText(decodeURIComponent(copyTagsBtn.getAttribute("data-text")), ()=> toast("Tag list copied.", "ok"));
     };
   }
 
   document.getElementById("openTeleprompterBtn").onclick = ()=> openTeleprompter(buildFullScript(outline));
   document.getElementById("copyScriptBtn").onclick = ()=>{
-    navigator.clipboard.writeText(buildFullScript(outline)).then(()=>{
+    copyText(buildFullScript(outline), ()=>{
       toast("Full script copied.", "ok");
       logHistory("Copied video script", outline.subject);
     });
@@ -4564,7 +4628,7 @@ function renderOutline(outline){
     logHistory("Generated video description", outline.subject);
   };
   document.getElementById("copyDescBtn").onclick = ()=>{
-    navigator.clipboard.writeText(document.getElementById("descOutput").value).then(()=> toast("Description copied.", "ok"));
+    copyText(document.getElementById("descOutput").value, ()=> toast("Description copied.", "ok"));
   };
   document.getElementById("genShortBtn").onclick = ()=>{
     const box = document.getElementById("shortOutput");
@@ -4574,7 +4638,7 @@ function renderOutline(outline){
     logHistory("Generated short-form script", outline.subject);
   };
   document.getElementById("copyShortBtn").onclick = ()=>{
-    navigator.clipboard.writeText(document.getElementById("shortOutput").value).then(()=> toast("Short script copied.", "ok"));
+    copyText(document.getElementById("shortOutput").value, ()=> toast("Short script copied.", "ok"));
   };
   document.getElementById("genCorrectionBtn").onclick = ()=>{
     const note = document.getElementById("correctionInput").value.trim();
@@ -4585,7 +4649,7 @@ function renderOutline(outline){
     logHistory("Generated correction note", outline.subject);
   };
   document.getElementById("copyCorrectionBtn").onclick = ()=>{
-    navigator.clipboard.writeText(document.getElementById("correctionOutput").value).then(()=> toast("Correction note copied.", "ok"));
+    copyText(document.getElementById("correctionOutput").value, ()=> toast("Correction note copied.", "ok"));
   };
 }
 
@@ -5156,13 +5220,7 @@ document.addEventListener("keydown", (e)=>{
 
 // ---------- TELEPROMPTER FOCUS TRAP ----------
 document.getElementById("teleprompterOverlay").addEventListener("keydown", (e)=>{
-  if(e.key !== "Tab") return;
-  const overlay = document.getElementById("teleprompterOverlay");
-  const focusables = overlay.querySelectorAll("button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])");
-  if(focusables.length === 0) return;
-  const first = focusables[0], last = focusables[focusables.length - 1];
-  if(e.shiftKey && document.activeElement === first){ e.preventDefault(); last.focus(); }
-  else if(!e.shiftKey && document.activeElement === last){ e.preventDefault(); first.focus(); }
+  trapFocus(document.getElementById("teleprompterOverlay"), e);
 });
 
 // ---------- ENCRYPTED AUTOSAVE (opt-in, off by default) ----------
@@ -5252,16 +5310,29 @@ function renderEncryptionUI(){
   lockedForm.style.display = "none";
 }
 
+let unlockPreviouslyFocused = null;
 function showUnlockOverlay(){
   const overlay = document.getElementById("unlockOverlay");
   overlay.classList.add("open");
   document.getElementById("unlockError").style.display = "none";
   document.getElementById("unlockPassInput").value = "";
+  unlockPreviouslyFocused = document.activeElement;
   document.getElementById("unlockPassInput").focus();
 }
 function hideUnlockOverlay(){
   document.getElementById("unlockOverlay").classList.remove("open");
+  if(unlockPreviouslyFocused && typeof unlockPreviouslyFocused.focus === "function") unlockPreviouslyFocused.focus();
 }
+// Keyboard users need the same two things this overlay's mouse users
+// already have: a way to dismiss it (Escape mirrors the existing "stay
+// locked, continue with sample data" button) and Tab/Shift+Tab kept inside
+// the overlay's own controls rather than escaping onto the hidden page
+// behind it.
+document.getElementById("unlockOverlay").addEventListener("keydown", (e)=>{
+  if(!document.getElementById("unlockOverlay").classList.contains("open")) return;
+  if(e.key === "Escape"){ hideUnlockOverlay(); return; }
+  trapFocus(document.getElementById("unlockOverlay"), e);
+});
 
 async function attemptUnlock(){
   const passInput = document.getElementById("unlockPassInput");

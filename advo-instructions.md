@@ -232,7 +232,7 @@ Shortcuts are disabled while you're typing in any text box, while the teleprompt
 
 ## Accessibility
 
-Every clickable fact, angle, and outlet-lean badge is keyboard-reachable (Tab to focus, Enter/Space to activate), the teleprompter traps focus while open and returns it to where you were when you close it, toasts are announced to screen readers and can be dismissed manually or paused by hovering, and every text input has a real label even where the visible design just shows placeholder text.
+Every clickable fact, angle, and outlet-lean badge is keyboard-reachable (Tab to focus, Enter/Space to activate). Both full-screen overlays — the teleprompter and the encrypted-session unlock screen — trap Tab/Shift+Tab inside their own controls while open (so keyboard focus never lands on the page behind them), support Escape to close, and return focus to wherever you were once you close them. Toasts are announced to screen readers and can be dismissed manually or paused by hovering. Every text input has a real label even where the visible design just shows placeholder text. Every "Copy" button falls back to a legacy copy method if the browser's clipboard API is unavailable or blocked, and tells you plainly if copying failed altogether — it never just does nothing.
 
 ---
 
