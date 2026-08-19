@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "description": "A fact-based content builder for creators — pick a fact, pick an angle, format for any platform. Runs entirely offline, no account required.",
   "main": "main.js",
-  "author": "Kushy",
+  "author": {
+    "name": "Kushy",
+    "email": "echoofeyziq@gmail.com"
+  },
   "license": "MIT",
   "private": true,
   "scripts": {
