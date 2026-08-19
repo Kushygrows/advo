@@ -15,7 +15,31 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    # Runs the Playwright regression suite against advo.html on every push,
+    # before anything gets built. This is the real replacement for the old
+    # "Advo Nightly Regression QA" scheduled task, which was structurally
+    # broken from the start (every scheduled-task run starts in a fresh,
+    # empty environment with no copy of the repo). A push-triggered CI job
+    # doesn't have that problem -- it checks out the real repo every time.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install -r tests/requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Run regression suite
+        run: python3 tests/run_regression.py
+
   build:
+    needs: test
     strategy:
       fail-fast: false
       matrix:
