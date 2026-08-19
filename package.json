@@ -1,0 +1,61 @@
+{
+  "name": "advo",
+  "version": "1.0.0",
+  "description": "A fact-based content builder for creators — pick a fact, pick an angle, format for any platform. Runs entirely offline, no account required.",
+  "main": "main.js",
+  "author": "Kushy",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dist:linux": "electron-builder --linux AppImage deb",
+    "dist:win": "electron-builder --win nsis portable",
+    "dist": "electron-builder --linux AppImage deb --win nsis portable"
+  },
+  "devDependencies": {
+    "electron": "^43.0.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.advo.app",
+    "productName": "Advo",
+    "copyright": "Copyright © 2026 Kushy",
+    "files": [
+      "main.js",
+      "advo.html",
+      "advo-tutorial.mp4",
+      "build/icon.png",
+      "build/icon.ico"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": ["nsis", "portable"],
+      "icon": "build/icon.ico"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "icon": "build/icon.png",
+      "category": "Utility"
+    },
+    "portable": {
+      "artifactName": "Advo-${version}-portable.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerSidebar": "build/installerSidebar.bmp",
+      "license": "build/license.txt",
+      "artifactName": "Advo-Setup-${version}.${ext}",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Advo",
+      "menuCategory": false
+    }
+  }
+}

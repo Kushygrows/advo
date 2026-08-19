@@ -1,0 +1,24 @@
+name = "advo-cloud"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+# Create this KV namespace with:
+#   npx wrangler kv namespace create ADVO_LICENSES
+# then paste the id it prints below.
+kv_namespaces = [
+  { binding = "ADVO_LICENSES", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
+]
+
+# Public config for the optional Stellar (XLM) payment path — safe to commit,
+# unlike secrets below, since a receiving address is meant to be shared.
+# STELLAR_NETWORK: "testnet" (default, no real money — good for trying this
+# out) or "public" (real mainnet XLM). Leave STELLAR_ADDRESS unset to keep
+# the Stellar payment option disabled (advo.html hides it automatically).
+[vars]
+STELLAR_ADDRESS = ""
+STELLAR_NETWORK = "testnet"
+
+# Secrets (never put these in this file — set them with `wrangler secret put`):
+#   ANTHROPIC_API_KEY
+#   ANTHROPIC_MODEL
+#   LEMONSQUEEZY_WEBHOOK_SECRET
