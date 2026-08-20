@@ -25,7 +25,7 @@
     "copyright": "Copyright © 2026 Kushy",
     "publish": {
       "provider": "github",
-      "draft": true
+      "releaseType": "draft"
     },
     "files": [
       "main.js",
