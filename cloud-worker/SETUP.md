@@ -258,16 +258,27 @@ Redeploy, and you're live.
 - It stores only: license key, credit balance, and the email Lemon Squeezy
   attaches to the key. No fact banks, drafts, or other app content ever
   reaches it — `/research` only ever receives the subject line a user typed.
-- A failed upstream Anthropic call does not consume a credit (see the test
-  suite this was verified against, or read `handleResearch` in `src/index.js`
-  — the credit is decremented only after a successful response).
+- A failed upstream Anthropic call does not consume a credit. The credit is
+  actually decremented *before* the Anthropic call now (2026-08-20 security
+  fix — see `LicenseGate` in `src/index.js`), atomically, specifically so a
+  burst of concurrent requests on one key can't each slip through and each
+  trigger a billed call before any single decrement lands. If the Anthropic
+  call then fails for any reason, that credit is automatically refunded —
+  same net guarantee as before (a failure never costs you a credit), just
+  implemented so it can't be exploited by concurrent requests. See
+  `cloud-worker/test_license_gate.mjs` for the test that verifies this,
+  including a concurrency simulation.
 - Credits are tracked here, independent of Lemon Squeezy's own
   `activation_limit` concept, so a buyer can use their key from as many
   devices as they like — the limit is credits, not device activations.
 - The Stellar path never sees or holds a private key — only your public
   address, which is meant to be shared. There's no custody of funds by this
   Worker at any point; XLM goes straight from the buyer's wallet to yours.
-- Order-matching (`/stellar/order/:id`) reads an order's status from KV then
-  writes back — not a single atomic step. At indie-scale traffic this is a
-  non-issue; the realistic worst case is one wasted extra license key for an
-  order that was already paid, never a lost payment or free credits.
+- Order-matching (`/stellar/order/:id`) used to read an order's status from
+  KV then write back as two separate steps — not atomic, so two polls
+  arriving close together around the moment payment confirmed could each
+  mint and grant a separate license key for the same payment. Fixed
+  2026-08-20 (same `LicenseGate` mechanism as the `/research` fix above):
+  the claim-and-mint step is now atomic per order, so only the first poll
+  to see "payment confirmed" actually mints a key — every other concurrent
+  poll gets back that same key instead of minting its own.

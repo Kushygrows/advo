@@ -19,8 +19,19 @@
   LM Studio). If you deploy your own Advo Cloud worker on a non-https or
   otherwise unusual origin, no change is needed here since https: is already
   allowed broadly.
+
+  script-src uses exact sha256 hashes of the two inline script blocks
+  instead of 'unsafe-inline', so an actual future injection (a script tag
+  smuggled into the page some other way) can't execute even if it slips
+  past escaping -- only these two exact, known-good scripts are allowed to
+  run. IMPORTANT: if you edit either inline script block's contents, these
+  two hashes go stale and the whole app will silently fail to run (CSP
+  blocks it, no visible error beyond the browser console). Recompute them with
+  `python3 tests/verify_csp_hashes.py --print` and this is also checked
+  automatically by tests/verify_csp_hashes.py, which runs as part of the
+  regression suite and CI, specifically to catch this before it ships.
 -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src https: http://localhost:11434 http://localhost:1234; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none';">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'sha256-mLhaNvxuHPDomQ+fQ/guuj/PgF2GGVfb2w1kbNPPXVI=' 'sha256-S3sVYqkGEIVs8OfmtYulPumVQ95HfmbsGvmWB6CP+S0='; style-src 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src https: http://localhost:11434 http://localhost:1234; base-uri 'none'; form-action 'none'; object-src 'none'; frame-src 'none';">
 <title>Advo — Truth · Context · Evidence</title>
 <meta name="description" content="Advo — the fact-checked content engine for creators and researchers. Sourced facts, bias checking, and platform-ready drafts. Free, offline, no account.">
 <!-- Favicon: the same distilled logomark as .brand-mark in the header (triangle + ring + crossed hammer/sword accent), tested legible down to 16px despite the gradient — the bold ring and solid blue accent carry it at tiny sizes even though the chrome fill itself blurs to flat gray. -->
@@ -5238,7 +5249,19 @@ document.getElementById("teleprompterOverlay").addEventListener("keydown", (e)=>
 // protect against something already running inside your own unlocked
 // browser session (malware or a rogue extension with page access could still
 // read facts off the screen) — no client-side scheme can promise that.
-const PBKDF2_ITERATIONS = 250000;
+// Iteration count is versioned, not a single constant, so raising it later
+// (as OWASP's recommended minimum rises over time) never breaks decrypting
+// blobs written under an older, lower count. Each payload records which
+// version encrypted it (payload.v); decryptJSON looks up that version's
+// count instead of always using the current one. Only ever ADD a new
+// version here going forward -- never change what an existing version
+// number means, or every blob written under it becomes undecryptable.
+const PBKDF2_ITERATIONS_BY_VERSION = {
+  1: 250000,   // original value
+  2: 600000,   // raised 2026-08-20 per security audit (OWASP's current
+               // PBKDF2-HMAC-SHA256 minimum recommendation)
+};
+const CURRENT_ENCRYPTION_VERSION = 2;
 function bufToBase64(buf){
   let binary = "";
   const bytes = new Uint8Array(buf);
@@ -5252,11 +5275,11 @@ function base64ToBuf(b64){
   return bytes.buffer;
 }
 function cryptoAvailable(){ return !!(window.crypto && window.crypto.subtle); }
-async function deriveAesKey(passphrase, saltBytes){
+async function deriveAesKey(passphrase, saltBytes, iterations){
   const enc = new TextEncoder();
   const baseKey = await crypto.subtle.importKey("raw", enc.encode(passphrase), "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
-    {name:"PBKDF2", salt:saltBytes, iterations:PBKDF2_ITERATIONS, hash:"SHA-256"},
+    {name:"PBKDF2", salt:saltBytes, iterations, hash:"SHA-256"},
     baseKey,
     {name:"AES-GCM", length:256},
     false,
@@ -5266,15 +5289,18 @@ async function deriveAesKey(passphrase, saltBytes){
 async function encryptJSON(passphrase, obj){
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveAesKey(passphrase, salt);
+  const key = await deriveAesKey(passphrase, salt, PBKDF2_ITERATIONS_BY_VERSION[CURRENT_ENCRYPTION_VERSION]);
   const enc = new TextEncoder();
   const ciphertext = await crypto.subtle.encrypt({name:"AES-GCM", iv}, key, enc.encode(JSON.stringify(obj)));
-  return { encrypted:true, v:1, salt:bufToBase64(salt), iv:bufToBase64(iv), data:bufToBase64(ciphertext) };
+  return { encrypted:true, v:CURRENT_ENCRYPTION_VERSION, salt:bufToBase64(salt), iv:bufToBase64(iv), data:bufToBase64(ciphertext) };
 }
 async function decryptJSON(passphrase, payload){
   const salt = new Uint8Array(base64ToBuf(payload.salt));
   const iv = new Uint8Array(base64ToBuf(payload.iv));
-  const key = await deriveAesKey(passphrase, salt);
+  // Old blobs saved before versioning existed are all v1 -- there's no
+  // "v0", so a missing field always means the original 250000 count.
+  const iterations = PBKDF2_ITERATIONS_BY_VERSION[payload.v || 1];
+  const key = await deriveAesKey(passphrase, salt, iterations);
   const dec = new TextDecoder();
   // AES-GCM's built-in authentication tag means a wrong passphrase throws
   // here rather than silently returning garbage — that's what powers the

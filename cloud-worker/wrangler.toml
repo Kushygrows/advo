@@ -9,6 +9,20 @@ kv_namespaces = [
   { binding = "ADVO_LICENSES", id = "REPLACE_WITH_YOUR_KV_NAMESPACE_ID" }
 ]
 
+# LicenseGate Durable Object -- closes the /research credit race and the
+# Stellar order-claim race (2026-08-20 security audit fix). Unlike the KV
+# namespace above, this needs NO manual setup: `npx wrangler deploy` reads
+# the binding + migration below and provisions it automatically the first
+# time you deploy. See the LicenseGate class doc comment in src/index.js
+# for what it does and why.
+[[durable_objects.bindings]]
+name = "LICENSE_GATE"
+class_name = "LicenseGate"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["LicenseGate"]
+
 # Public config for the optional Stellar (XLM) payment path — safe to commit,
 # unlike secrets below, since a receiving address is meant to be shared.
 # STELLAR_NETWORK: "testnet" (default, no real money — good for trying this

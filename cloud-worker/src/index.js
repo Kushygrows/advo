@@ -35,6 +35,10 @@
  *   STELLAR_NETWORK   "testnet" (default) or "public"
  *
  * Required KV namespace binding (see wrangler.toml): ADVO_LICENSES
+ * Required Durable Object binding (see wrangler.toml): LICENSE_GATE — see
+ *   the LicenseGate class below for what it's for. `wrangler deploy` sets
+ *   this up automatically from wrangler.toml's [[durable_objects.bindings]]
+ *   and [[migrations]] entries; no separate manual step needed.
  *
  * CREDIT_PACKS below maps a Lemon Squeezy product_id -> credits granted.
  * Update the IDs after you create your products (see ../SETUP.md).
@@ -51,6 +55,20 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type"
 };
+
+// Shared rate-limit tuning, used by both /research and /verify (see
+// LicenseGate.rateLimit below). /research spends real money per call, so
+// its limit is deliberately tighter than /verify's, which is a free read.
+// Both are keyed per license key, not per IP — this stops the specific
+// abuse pattern of hammering ONE (real, paid-for) key with concurrent or
+// rapid-fire requests. It does not stop someone probing with many
+// different/garbage license keys, each of which gets its own fresh
+// rate-limit bucket — that's a different threat (general endpoint abuse,
+// not credit-race exploitation) and would need IP- or Cloudflare-level
+// rate limiting to close, which is out of scope for this fix.
+const RATE_WINDOW_MS = 60 * 1000;
+const RESEARCH_RATE_LIMIT = 10;
+const VERIFY_RATE_LIMIT = 30;
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -85,6 +103,134 @@ async function verifyLemonSqueezySignature(request, secret) {
   return timingSafeEqual(digest, signature);
 }
 
+// ---------- LicenseGate Durable Object ----------
+// One Durable Object class, reused to close two structurally identical
+// races found in a 2026-08-20 security audit: /research's credit
+// check-then-decrement, and the Stellar order's pending->paid claim. Both
+// were plain KV read-modify-write sequences (get, decide, put) with no
+// atomicity — two concurrent requests for the SAME key could both read
+// the same starting state, both decide "yes", and both write, the second
+// silently clobbering the first's effect. For /research specifically that
+// meant concurrent requests on one license key could each slip past the
+// credit check and each trigger a real, billed Anthropic call before any
+// single decrement landed — direct, repeatable cost exposure with no
+// payment or exploit sophistication required.
+//
+// A Durable Object closes this for free, with no manual locking: Cloudflare
+// guarantees a single DO instance handles one request at a time, in order,
+// so concurrent requests routed to the same instance are simply queued and
+// run one after another — there's nothing left to interleave. This class
+// doesn't hold its own copy of license/order data; every op below still
+// reads and writes the SAME ADVO_LICENSES KV entries as before (`env` is
+// shared with the parent Worker script automatically), so no data
+// migration happened and nothing about where data lives changed — this is
+// purely a serialization gate in front of the existing storage.
+//
+// Callers get an instance via callGate(env, idSeed, op, args) below.
+// idSeed is a string; env.LICENSE_GATE.idFromName(idSeed) means every
+// call that uses the SAME idSeed — from any request, at any time — is
+// routed to the same DO instance and serialized against each other.
+// Convention used throughout this file: idSeed is either a raw license
+// key (for credit ops), `order:<orderId>` (for Stellar order ops), or
+// `webhook:<eventId>` (for webhook-delivery dedup, which never touches KV
+// at all — see claimOnce).
+const LICENSE_GATE_OPS = new Set(["getRecord", "addCredits", "decrementCredits", "claimOnce", "rateLimit"]);
+
+export class LicenseGate {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "invalid JSON body" }, 400);
+    }
+    if (!LICENSE_GATE_OPS.has(body.op)) {
+      return json({ error: `unknown op "${body.op}"` }, 400);
+    }
+    try {
+      return await this[body.op](body);
+    } catch (err) {
+      console.error("LicenseGate op failed:", body.op, err.message);
+      return json({ error: "LicenseGate internal error: " + err.message }, 500);
+    }
+  }
+
+  async getRecord({ kvKey }) {
+    const record = await this.env.ADVO_LICENSES.get(kvKey, "json");
+    return json({ record: record || null });
+  }
+
+  async addCredits({ kvKey, amount, merge }) {
+    const record = (await this.env.ADVO_LICENSES.get(kvKey, "json")) || { credits: 0 };
+    record.credits = (record.credits || 0) + (amount || 0);
+    Object.assign(record, merge || {});
+    await this.env.ADVO_LICENSES.put(kvKey, JSON.stringify(record));
+    return json({ ok: true, record });
+  }
+
+  async decrementCredits({ kvKey, amount }) {
+    const record = await this.env.ADVO_LICENSES.get(kvKey, "json");
+    if (!record || record.credits < amount) {
+      return json({ ok: false, record: record || null });
+    }
+    record.credits -= amount;
+    await this.env.ADVO_LICENSES.put(kvKey, JSON.stringify(record));
+    return json({ ok: true, record });
+  }
+
+  // First caller wins, permanently, for this DO instance (i.e. for this
+  // idSeed) — every later call just sees ok:false. `kvKey`/`merge` are
+  // optional: if given, the winning call also writes `merge` into that KV
+  // record's fields as part of the same atomic step (used for the Stellar
+  // paid-claim, which needs to both claim-once AND record the result).
+  // Webhook dedup uses this with no kvKey at all, since there's nothing to
+  // write to KV for "have I seen this event id before."
+  async claimOnce({ kvKey, merge }) {
+    const alreadyClaimed = await this.state.storage.get("claimed");
+    if (alreadyClaimed) {
+      const record = kvKey ? await this.env.ADVO_LICENSES.get(kvKey, "json") : null;
+      return json({ ok: false, record });
+    }
+    await this.state.storage.put("claimed", true);
+    let record = null;
+    if (kvKey) {
+      record = (await this.env.ADVO_LICENSES.get(kvKey, "json")) || {};
+      Object.assign(record, merge || {});
+      await this.env.ADVO_LICENSES.put(kvKey, JSON.stringify(record));
+    }
+    return json({ ok: true, record });
+  }
+
+  // Sliding-window limiter, local to this DO instance's own storage (not
+  // KV) — old timestamps outside the window are dropped every call, so
+  // this never grows unbounded.
+  async rateLimit({ limit, windowMs }) {
+    const now = Date.now();
+    const timestamps = ((await this.state.storage.get("rl")) || []).filter((t) => now - t < windowMs);
+    if (timestamps.length >= limit) {
+      return json({ ok: false, retryAfterMs: windowMs - (now - timestamps[0]) });
+    }
+    timestamps.push(now);
+    await this.state.storage.put("rl", timestamps);
+    return json({ ok: true });
+  }
+}
+
+async function callGate(env, idSeed, op, args = {}) {
+  const id = env.LICENSE_GATE.idFromName(idSeed);
+  const stub = env.LICENSE_GATE.get(id);
+  const res = await stub.fetch("https://license-gate/op", {
+    method: "POST",
+    body: JSON.stringify({ op, ...args })
+  });
+  return res.json();
+}
+
 async function handleWebhook(request, env) {
   if (!(await verifyLemonSqueezySignature(request, env.LEMONSQUEEZY_WEBHOOK_SECRET))) {
     return json({ error: "invalid signature" }, 401);
@@ -104,6 +250,11 @@ async function handleWebhook(request, env) {
   const productId = String(attrs.product_id);
   const email = attrs.user_email;
   const credits = CREDIT_PACKS[productId];
+  // Lemon Squeezy's own resource id for this delivery — used to dedupe a
+  // retried webhook. Lemon Squeezy retries on transient failure, and
+  // without this a retried delivery would silently double-credit the same
+  // purchase every time it landed.
+  const webhookEventId = payload.data && payload.data.id;
 
   if (!key) return json({ error: "webhook payload missing license key" }, 400);
   if (!credits) {
@@ -113,17 +264,30 @@ async function handleWebhook(request, env) {
     return json({ ok: true, ignored: `product_id ${productId} not in CREDIT_PACKS` });
   }
 
-  const existing = await env.ADVO_LICENSES.get(key, "json");
-  const newBalance = (existing ? existing.credits : 0) + credits;
-  await env.ADVO_LICENSES.put(key, JSON.stringify({ credits: newBalance, email }));
+  if (webhookEventId) {
+    const claim = await callGate(env, `webhook:${webhookEventId}`, "claimOnce", {});
+    if (!claim.ok) {
+      return json({ ok: true, deduped: true, key });
+    }
+  } else {
+    // No usable id to dedupe against — proceed and credit anyway rather
+    // than silently drop a real purchase; log it so it's visible.
+    console.error("Lemon Squeezy webhook payload missing data.id — cannot dedupe this delivery.");
+  }
 
-  return json({ ok: true, key, creditsGranted: credits, newBalance });
+  const result = await callGate(env, key, "addCredits", { kvKey: key, amount: credits, merge: { email } });
+
+  return json({ ok: true, key, creditsGranted: credits, newBalance: result.record.credits });
 }
 
 async function handleVerify(request, env) {
   const { licenseKey } = await request.json();
   if (!licenseKey) return json({ error: "licenseKey required" }, 400);
-  const record = await env.ADVO_LICENSES.get(licenseKey, "json");
+
+  const limited = await callGate(env, licenseKey, "rateLimit", { limit: VERIFY_RATE_LIMIT, windowMs: RATE_WINDOW_MS });
+  if (!limited.ok) return json({ error: "Too many requests. Try again in a moment." }, 429);
+
+  const { record } = await callGate(env, licenseKey, "getRecord", { kvKey: licenseKey });
   if (!record) return json({ valid: false, credits: 0 });
   return json({ valid: true, credits: record.credits, email: record.email });
 }
@@ -131,43 +295,66 @@ async function handleVerify(request, env) {
 async function handleResearch(request, env) {
   const { licenseKey, prompt } = await request.json();
   if (!licenseKey || !prompt) return json({ error: "licenseKey and prompt are required" }, 400);
-
-  const record = await env.ADVO_LICENSES.get(licenseKey, "json");
-  if (!record || record.credits <= 0) {
-    return json({ error: "No credits remaining on this license key." }, 402);
-  }
   if (!env.ANTHROPIC_MODEL) {
     return json({ error: "Server misconfigured: ANTHROPIC_MODEL secret is not set." }, 500);
   }
 
-  const anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "x-api-key": env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
-    body: JSON.stringify({
-      model: env.ANTHROPIC_MODEL,
-      max_tokens: 3000,
-      messages: [{ role: "user", content: prompt }],
-      tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }]
-    })
-  });
+  const limited = await callGate(env, licenseKey, "rateLimit", { limit: RESEARCH_RATE_LIMIT, windowMs: RATE_WINDOW_MS });
+  if (!limited.ok) return json({ error: "Too many requests. Try again in a moment." }, 429);
+
+  // Atomic check-and-decrement happens BEFORE the (expensive, real-money)
+  // Anthropic call below, not after — this is the actual fix for the
+  // credit race. No request can reach the Anthropic call at all unless it
+  // just atomically won a real credit, via the LicenseGate DO instance for
+  // this exact license key (see LicenseGate.decrementCredits above), so
+  // concurrent requests on one key can no longer each slip through and
+  // each trigger a billed call before any single decrement lands.
+  const decrement = await callGate(env, licenseKey, "decrementCredits", { kvKey: licenseKey, amount: 1 });
+  if (!decrement.ok) {
+    return json({ error: "No credits remaining on this license key." }, 402);
+  }
+
+  let anthropicRes;
+  try {
+    anthropicRes = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": env.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: env.ANTHROPIC_MODEL,
+        max_tokens: 3000,
+        messages: [{ role: "user", content: prompt }],
+        tools: [{ type: "web_search_20250305", name: "web_search", max_uses: 6 }]
+      })
+    });
+  } catch (err) {
+    // Network-level failure reaching Anthropic at all (not an HTTP error
+    // response, an actual thrown exception) — refund the credit we already
+    // atomically took, same as every other failure path below.
+    await callGate(env, licenseKey, "addCredits", { kvKey: licenseKey, amount: 1 });
+    console.error("Anthropic call threw:", err.message);
+    return json({ error: "Research call failed. Your credit was not spent — try again." }, 502);
+  }
 
   if (!anthropicRes.ok) {
     const errText = await anthropicRes.text().catch(() => "");
-    return json({ error: `Research call failed (HTTP ${anthropicRes.status}). ${errText.slice(0, 300)}` }, 502);
+    console.error(`Anthropic call failed HTTP ${anthropicRes.status}:`, errText.slice(0, 500));
+    await callGate(env, licenseKey, "addCredits", { kvKey: licenseKey, amount: 1 });
+    return json({ error: "Research call failed. Your credit was not spent — try again." }, 502);
   }
 
   const data = await anthropicRes.json();
   const textBlocks = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
-  if (!textBlocks) return json({ error: "Model response had no usable text." }, 502);
+  if (!textBlocks) {
+    await callGate(env, licenseKey, "addCredits", { kvKey: licenseKey, amount: 1 });
+    console.error("Anthropic response had no usable text block:", JSON.stringify(data).slice(0, 500));
+    return json({ error: "Research call returned no usable result. Your credit was not spent — try again." }, 502);
+  }
 
-  record.credits -= 1;
-  await env.ADVO_LICENSES.put(licenseKey, JSON.stringify(record));
-
-  return json({ text: textBlocks, creditsRemaining: record.credits });
+  return json({ text: textBlocks, creditsRemaining: decrement.record.credits });
 }
 
 // ---------- Stellar (XLM) payments — an alternative to Lemon Squeezy ----------
@@ -254,7 +441,8 @@ async function handleStellarQuote(request, env) {
   try {
     xlmPrice = await getXlmUsdPrice();
   } catch (err) {
-    return json({ error: `Couldn't get a live XLM price right now: ${err.message} Try again in a moment.` }, 502);
+    console.error("XLM price lookup failed:", err.message);
+    return json({ error: "Couldn't get a live XLM price right now. Try again in a moment." }, 502);
   }
 
   // 7 decimal places is Stellar's own precision limit for its native asset.
@@ -333,13 +521,6 @@ async function checkHorizonForPayment(env, memo, minAmount) {
   return null;
 }
 
-// Note on concurrency: this reads the order from KV, decides, then writes
-// back — not a single atomic operation. At indie-scale traffic (one buyer
-// polling their own order every few seconds) the odds of two overlapping
-// requests both landing on the same order right as payment confirms are
-// vanishingly small, and the worst case is one wasted extra license key
-// minted for the same paid order — not a lost payment or free credits. A
-// Durable Object would close that gap entirely if this ever needs it.
 async function handleStellarOrderStatus(env, orderId) {
   const key = `order:${orderId}`;
   const order = await env.ADVO_LICENSES.get(key, "json");
@@ -364,7 +545,8 @@ async function handleStellarOrderStatus(env, orderId) {
   } catch (err) {
     // Horizon hiccup — tell the client to keep polling rather than treat a
     // failed lookup as confirmation that no payment has arrived.
-    return json({ status: "pending", note: `Temporary lookup issue, still watching: ${err.message}` });
+    console.error("Horizon payment lookup failed:", err.message);
+    return json({ status: "pending", note: "Temporary lookup issue, still watching." });
   }
 
   if (!match) return json({ status: "pending" });
@@ -377,17 +559,28 @@ async function handleStellarOrderStatus(env, orderId) {
     return json({ status: "underpaid", received: match.amount, expected: order.xlmAmount });
   }
 
-  // Payment matched and covers the tolerated amount — mint the key using
-  // the exact same record shape the Lemon Squeezy webhook writes.
+  // Payment matched and covers the tolerated amount — this used to be the
+  // race: multiple polls arriving around the same moment could each see
+  // "payment found, not yet claimed" and each mint + grant a separate
+  // license key for the SAME payment (real free credits, not just a
+  // wasted key). claimOnce is serialized per order id by the LicenseGate
+  // Durable Object (see above), so only the first poll to reach this point
+  // actually mints and writes; every other concurrent poll gets back the
+  // SAME already-minted key instead of minting its own.
   const licenseKey = generateLicenseKey();
-  const existing = await env.ADVO_LICENSES.get(licenseKey, "json");
-  const newBalance = (existing ? existing.credits : 0) + order.credits;
-  await env.ADVO_LICENSES.put(licenseKey, JSON.stringify({ credits: newBalance, source: "stellar" }));
+  const claim = await callGate(env, key, "claimOnce", {
+    kvKey: key,
+    merge: { status: "paid", licenseKey, txHash: match.txHash }
+  });
 
-  order.status = "paid";
-  order.licenseKey = licenseKey;
-  order.txHash = match.txHash;
-  await env.ADVO_LICENSES.put(key, JSON.stringify(order));
+  if (!claim.ok) {
+    // Someone else's poll already claimed this order first — return
+    // their result, not the (unused, never-credited) key generated above.
+    const finalOrder = claim.record || order;
+    return json({ status: finalOrder.status, licenseKey: finalOrder.licenseKey, credits: finalOrder.credits });
+  }
+
+  await callGate(env, licenseKey, "addCredits", { kvKey: licenseKey, amount: order.credits, merge: { source: "stellar" } });
 
   return json({ status: "paid", licenseKey, credits: order.credits });
 }
@@ -416,7 +609,12 @@ export default {
       }
       return json({ error: "not found" }, 404);
     } catch (err) {
-      return json({ error: "Server error: " + err.message }, 500);
+      // Generic message to the client -- the real detail goes to the
+      // Cloudflare dashboard's Worker logs (wrangler tail / Logs tab),
+      // where only you can see it, instead of being echoed back to
+      // whoever's request triggered it.
+      console.error("Unhandled error:", err.message, err.stack);
+      return json({ error: "Server error. Please try again." }, 500);
     }
   }
 };
