@@ -3,7 +3,9 @@ name: Build Advo Desktop App
 # Builds real Windows and Linux installers on GitHub's own native runners
 # (not cross-compiled). Every push to main uploads downloadable build
 # artifacts to the Actions run. Pushing a version tag (e.g. v1.0.0) also
-# publishes those installers to a GitHub Release automatically.
+# publishes those installers to a GitHub Release automatically -- as a
+# draft first, only made public once every OS build succeeds (see
+# finalize-release below).
 
 on:
   push:
@@ -11,8 +13,11 @@ on:
     tags: ["v*.*.*"]
   workflow_dispatch: {}
 
+# No blanket top-level permission -- each job below declares exactly what
+# it needs (least privilege). Default GITHUB_TOKEN permissions otherwise
+# apply, which for this repo are read-only.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   test:
@@ -23,12 +28,20 @@ jobs:
     # empty environment with no copy of the repo). A push-triggered CI job
     # doesn't have that problem -- it checks out the real repo every time.
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      # Needed for tests/run_regression.py's cloud-worker/test_license_gate.mjs
+      # step -- same Node version the build job uses, for consistency.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
 
       - name: Install Playwright + Chromium
         run: |
@@ -40,6 +53,8 @@ jobs:
 
   build:
     needs: test
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -77,3 +92,24 @@ jobs:
             dist/*.AppImage
             dist/*.deb
           if-no-files-found: ignore
+
+  finalize-release:
+    # electron-builder publishes tag builds as a DRAFT release (see the
+    # "publish" block in package.json). That means if one OS leg of the
+    # build matrix fails after the other already succeeded and uploaded
+    # its installers, the release just sits as an incomplete draft --
+    # nothing incomplete ever goes live. This job only runs for a tag
+    # push, and only after BOTH matrix legs of `build` succeed, and its
+    # only job is to flip that draft to a public release. If either
+    # build leg fails, this job is skipped and the draft stays hidden
+    # until the tag is re-pushed or the release is fixed manually.
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"

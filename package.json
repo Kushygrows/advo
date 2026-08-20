@@ -23,6 +23,10 @@
     "appId": "com.advo.app",
     "productName": "Advo",
     "copyright": "Copyright © 2026 Kushy",
+    "publish": {
+      "provider": "github",
+      "draft": true
+    },
     "files": [
       "main.js",
       "advo.html",
